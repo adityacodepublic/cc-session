@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "description": "Keyboard picker to list, resume, delete or start Claude Code sessions in the current folder",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adityacodepublic/cc-session.git"
+  },
   "bin": {
     "ccs": "bin/ccs.js"
   },

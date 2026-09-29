@@ -3,7 +3,7 @@
 list, resume, delete or start Claude Code sessions in the current folder
 
 ```
-npm i -g cc-session
+npm i -g @gitcodepublic/cc-session
 cd your-project
 ccs
 ```
