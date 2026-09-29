@@ -3,11 +3,13 @@
 //   up/down/home/end move | Enter resume | n new | d, d delete | q quit
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const readline = require('readline');
 const { spawn } = require('child_process');
 
-const claudeDir = path.join(process.env.HOME || process.env.USERPROFILE, '.claude');
+// Same folder Claude uses: CLAUDE_CONFIG_DIR if set, else ~/.claude
+const claudeDir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
 // Claude's folder name for a project: the working directory with every non-alphanumeric character
 // turned into '-'. Over 200 characters, Claude cuts it and adds a hash; it finds such a folder again
 // by its first 200 characters (case-insensitive), so we do the same.
