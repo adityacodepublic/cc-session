@@ -34,53 +34,135 @@ const sessionPaths = (id) => [
   path.join(claudeDir, 'file-history', id),
 ];
 
-// Title lines are appended all over the file; the last one wins.
-// /rename ("custom-title") beats the generated one ("ai-title"), like /resume.
-function lastMatch(text, re) {
-  let m, last;
-  while ((m = re.exec(text))) last = m[1];
-  return last === undefined ? undefined : JSON.parse(`"${last}"`);
+// ---- Which sessions /resume shows, and their titles ----
+// Rules read from claude.exe 2.1.284 (its session-list code). Claude looks only at the first and last
+// chunk of each file, so we do too.
+const CHUNK = 64 * 1024;
+const MESSAGE_MARK = '"parentUuid":'; // every real chat entry has it; title/cost lines do not
+const SDK_ENTRYPOINTS = new Set(['sdk-cli', 'sdk-ts', 'sdk-py']); // claude -p and the SDK
+const CASE_INSENSITIVE_FS = process.platform === 'win32' || process.platform === 'darwin';
+
+const slugOf = (p) => p.replace(/[^a-zA-Z0-9]/g, '-').slice(0, MAX_SLUG);
+const normalize = (p) => (CASE_INSENSITIVE_FS ? path.resolve(p).toLowerCase() : path.resolve(p));
+
+// Values of a JSON string field ("key":"value") found in text, JSON-unescaped.
+function values(text, key) {
+  const re = new RegExp(`"${key}":"((?:[^"\\\\]|\\\\.)*)"`, 'g');
+  return [...text.matchAll(re)].map((m) => JSON.parse(`"${m[1]}"`));
 }
+const firstValue = (text, key) => values(text, key)[0];
+const lastValue = (text, key) => values(text, key).at(-1);
 
-function findTitle(text) {
-  return (
-    lastMatch(text, /\{"type":"custom-title","customTitle":"((?:[^"\\]|\\.)*)"/g) ||
-    lastMatch(text, /\{"type":"ai-title","aiTitle":"((?:[^"\\]|\\.)*)"/g)
-  );
-}
-
-// Fast path: the latest title is normally near the end, so read only the last 64 KB.
-// A cut-off first line cannot match (the regex needs the full line start and end quote).
-// Slow path: no title in the tail, so search the whole file.
-const TAIL_BYTES = 64 * 1024;
-
-function getSessionTitle(sessionPath) {
+function readChunks(file) {
+  const fd = fs.openSync(file, 'r');
   try {
-    const fd = fs.openSync(sessionPath, 'r');
-    let tail;
-    try {
-      const size = fs.fstatSync(fd).size;
-      const len = Math.min(size, TAIL_BYTES);
+    const size = fs.fstatSync(fd).size;
+    const len = Math.min(size, CHUNK);
+    const read = (position) => {
       const buf = Buffer.alloc(len);
-      fs.readSync(fd, buf, 0, len, size - len);
-      tail = buf.toString('utf8');
-    } finally {
-      fs.closeSync(fd);
-    }
-    return findTitle(tail) || findTitle(fs.readFileSync(sessionPath, 'utf8')) || 'Untitled';
-  } catch {
-    return 'Untitled';
+      fs.readSync(fd, buf, 0, len, position);
+      return buf.toString('utf8');
+    };
+    return { size, head: read(0), tail: read(size - len) };
+  } finally {
+    fs.closeSync(fd);
   }
 }
+
+// Rule 1: a file with no real chat entry is only title/cost bookkeeping.
+function hasMessages(file, { size, head, tail }) {
+  if (head.includes(MESSAGE_MARK) || tail.includes(MESSAGE_MARK)) return true;
+  return size > CHUNK && fs.readFileSync(file, 'utf8').includes(MESSAGE_MARK);
+}
+
+// Rule 2: sub-agent transcript.
+const isSidechain = (head) => /"isSidechain":\s*true/.test(head);
+
+// Rule 3: started by `claude -p` or the SDK.
+const isSdkSession = (head, tail) => SDK_ENTRYPOINTS.has(firstValue(head, 'entrypoint') ?? lastValue(tail, 'entrypoint'));
+
+// Rule 4: the last "continued-in" line names a newer session. A chat message after it cancels it.
+const isRealMessage = (o) =>
+  o.type === 'assistant'
+    ? !o.isApiErrorMessage && typeof o.message?.stop_reason === 'string'
+    : !o.isMeta && (typeof o.message?.content === 'string' || o.message?.content?.some?.((b) => b.type === 'text'));
+
+function continuedInSessionId(tail) {
+  const lines = tail.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const isContinuedIn = lines[i].includes('"type":"continued-in"');
+    if (!isContinuedIn && !lines[i].includes('"type":"user"') && !lines[i].includes('"type":"assistant"')) continue;
+    try {
+      const entry = JSON.parse(lines[i]);
+      if (isContinuedIn) return entry.continuedInSessionId || undefined;
+      if (isRealMessage(entry)) return undefined;
+    } catch {} // a line cut in half at the start of the tail
+  }
+}
+
+function isSuperseded(tail) {
+  const next = continuedInSessionId(tail);
+  if (!next) return false;
+  const nextFile = path.join(projectDir, `${next}.jsonl`);
+  try {
+    return hasMessages(nextFile, readChunks(nextFile));
+  } catch {
+    return false; // the newer session file is gone, so this one is still the latest
+  }
+}
+
+// Rule 5: the folder name is lossy (my.app and my-app share one), so check the folder the session ran in.
+function isFromOtherFolder(head) {
+  const cwd = firstValue(head, 'cwd');
+  return cwd !== undefined && normalize(cwd) !== normalize(process.cwd()) && slugOf(cwd) === slugOf(process.cwd());
+}
+
+// Title, like /resume: /rename title, then generated title, then the prompt, then "(session)".
+function readCustomTitleFile(id) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(projectDir, id, 'custom-title.json'), 'utf8')).customTitle || undefined;
+  } catch {}
+}
+
+function firstUserPrompt(head) {
+  for (const line of head.split('\n')) {
+    if (!line.includes('"type":"user"') || line.includes('"tool_result"') || line.includes('"isMeta":true')) continue;
+    try {
+      const content = JSON.parse(line).message?.content;
+      const text = (typeof content === 'string' ? content : content?.find?.((b) => b.type === 'text')?.text)?.trim();
+      if (text && !text.startsWith('<')) return text;
+    } catch {}
+  }
+}
+
+const getTitle = (id, { head, tail }) =>
+  lastValue(tail, 'customTitle') ??
+  readCustomTitleFile(id) ??
+  lastValue(head, 'customTitle') ??
+  lastValue(tail, 'aiTitle') ??
+  lastValue(head, 'aiTitle') ??
+  (lastValue(tail, 'lastPrompt') || firstUserPrompt(head) || '(session)');
 
 function getSessions() {
   if (!fs.existsSync(projectDir)) return [];
   return fs
     .readdirSync(projectDir)
     .filter((f) => f.endsWith('.jsonl'))
-    .map((f) => {
+    .flatMap((f) => {
       const file = path.join(projectDir, f);
-      return { id: f.slice(0, -'.jsonl'.length), title: getSessionTitle(file), mtime: fs.statSync(file).mtime };
+      const id = f.slice(0, -'.jsonl'.length);
+      try {
+        const chunks = readChunks(file);
+        const hidden =
+          !hasMessages(file, chunks) ||
+          isSidechain(chunks.head) ||
+          isSdkSession(chunks.head, chunks.tail) ||
+          isSuperseded(chunks.tail) ||
+          isFromOtherFolder(chunks.head);
+        return hidden ? [] : [{ id, title: getTitle(id, chunks), mtime: fs.statSync(file).mtime }];
+      } catch {
+        return []; // unreadable file
+      }
     })
     .sort((a, b) => b.mtime - a.mtime);
 }

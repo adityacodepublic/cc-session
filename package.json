@@ -1,6 +1,6 @@
 {
   "name": "@gitcodepublic/cc-session",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Keyboard picker to list, resume, delete or start Claude Code sessions in the current folder",
   "license": "MIT",
   "repository": {
