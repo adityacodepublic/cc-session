@@ -1,5 +1,5 @@
 {
-  "name": "cc-session",
+  "name": "@gitcodepublic/cc-session",
   "version": "0.1.0",
   "description": "Keyboard picker to list, resume, delete or start Claude Code sessions in the current folder",
   "license": "MIT",
